@@ -26,6 +26,8 @@
 static const char *TAG = "st7789v";
 
 uint8_t *internalBuffer; //Internal transfer buffer for doing partial updates
+uint8_t *internalBufferW; //Write pointer for the internal buffer
+unsigned int internalBufferBitLen; //Internal buffer length
 
 static spi_device_handle_t spi_bus = NULL;
 
@@ -44,15 +46,72 @@ const uint8_t st7789v_init_data[] = {
 	0x00
 };
 
-esp_err_t driver_st7789v_send(const uint8_t *data, int len, const uint8_t dc_level)
+void clear_transfer(void) {
+    internalBufferW = internalBuffer;
+    internalBufferBitLen = 0;
+    memset(internalBuffer, '\0', CONFIG_DRIVER_VSPI_MAX_TRANSFERSIZE);
+}
+
+enum ByteType {
+    CommandByte = 0,
+    DataByte = 1,
+};
+
+void add_byte_to_transfer(enum ByteType type, const uint8_t byte)
 {
-	if (len == 0) return ESP_OK;
-	spi_transaction_t t = {
-		.length = len * 8,  // transaction length is in bits
+#if CONFIG_PIN_NUM_ST7789V_DCX>=0
+    *internalBufferW++ = byte;
+    internalBufferBitLen += 8;
+#else // CONFIG_PIN_NUM_ST7789V_DCX>=0
+    //free bits in current byte
+    int free_bits = 8 - (internalBufferBitLen % 8);
+
+    //encode Command or Data in first free bit
+    *internalBufferW |= type << (free_bits-1);
+    if (--free_bits == 0) {
+        internalBufferW++;
+        free_bits = 8;
+    }
+    *internalBufferW |= (uint8_t)(byte >> (8-free_bits));
+    internalBufferW++;
+    *internalBufferW = (uint8_t)byte << free_bits;
+    //Using 8 bits for data and 1 for D/C
+    internalBufferBitLen += 8 + 1;
+
+    //Complete byte used up, switch to next
+    if (internalBufferBitLen % 8 == 0)
+        internalBufferW++;
+#endif // CONFIG_PIN_NUM_ST7789V_DCX>=0
+}
+
+esp_err_t send_transfer(const uint8_t *data, int len, const uint8_t dc_level) {
+    spi_transaction_t t = {
+        .length = len,
 		.tx_buffer = data,
 		.user = (void *) &dc_level,
 	};
-	return spi_device_transmit(spi_bus, &t);
+	esp_err_t result = spi_device_transmit(spi_bus, &t);
+
+    clear_transfer();
+
+    return result;
+}
+
+esp_err_t driver_st7789v_send(const uint8_t *data, int len, const uint8_t dc_level)
+{
+	if (len == 0) return ESP_OK;
+#if CONFIG_PIN_NUM_ST7789V_DCX>=0
+        len = len*8;  // transaction length is in bits
+#else // CONFIG_PIN_NUM_ST7789V_DCX>=0
+    clear_transfer();
+    for (int i = 0; i < len; i++) {
+        add_byte_to_transfer(dc_level ? DataByte : CommandByte, data[i]);
+    }
+    data = internalBuffer;
+    len = internalBufferBitLen;
+#endif //CONFIG_PIN_NUM_ST7789V_DCX>=0
+
+    return send_transfer(data, len, dc_level);
 }
 
 esp_err_t driver_st7789v_receive(uint8_t *data, int len, const uint8_t dc_level)
@@ -177,23 +236,29 @@ esp_err_t driver_st7789v_init(void)
 	internalBuffer = heap_caps_malloc(CONFIG_DRIVER_VSPI_MAX_TRANSFERSIZE, MALLOC_CAP_8BIT);
 	if (!internalBuffer) return ESP_FAIL;
 	
+    clear_transfer();
+
 	//Initialize reset GPIO pin
 	#if CONFIG_PIN_NUM_ST7789V_RESET >= 0
 	res = gpio_set_direction(CONFIG_PIN_NUM_ST7789V_RESET, GPIO_MODE_OUTPUT);
 	if (res != ESP_OK) return res;
 	#endif
 
+    #if CONFIG_PIN_NUM_ST7789V_DCX>=0
 	//Initialize data/clock select GPIO pin
-	res = gpio_set_direction(CONFIG_PIN_NUM_ST7789V_DCX, GPIO_MODE_OUTPUT);
+    res = gpio_set_direction(CONFIG_CONFIG_PIN_NUM_ST7789V_DCX, GPIO_MODE_OUTPUT);
 	if (res != ESP_OK) return res;
-	
+    #endif //CONFIG_PIN_NUM_ST7789V_DCX>=0
+
 	static const spi_device_interface_config_t devcfg = {
 		.clock_speed_hz = CONFIG_DRIVER_ST7789V_SPI_SPEED,
 		.mode           = 0,  // SPI mode 0
 		.spics_io_num   = CONFIG_PIN_NUM_ST7789V_CS,
 		.queue_size     = 1,
 		.flags          = (SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_3WIRE),//SPI_DEVICE_HALFDUPLEX,
+        #if CONFIG_PIN_NUM_ST7789V_DCX>=0
 		.pre_cb         = driver_st7789v_spi_pre_transfer_callback, // Specify pre-transfer callback to handle D/C line
+        #endif //CONFIG_PIN_NUM_ST7789V_DCX>=0
 	};
 	res = spi_bus_add_device(VSPI_HOST, &devcfg, &spi_bus);
 	if (res != ESP_OK) return res;
@@ -273,16 +338,17 @@ esp_err_t driver_st7789v_write_partial(const uint8_t *frameBuffer, uint16_t x0, 
 		}
 		res = driver_st7789v_set_addr_window(x0+ST7789V_OFFSET_X, y0+ST7789V_OFFSET_Y, transactionWidth, h);
 		if (res != ESP_OK) return res;
+        clear_transfer();
 		for (uint16_t currentLine = 0; currentLine < h; currentLine++) {
 			for (uint16_t i = 0; i<transactionWidth; i++) {
 				uint8_t color8 = frameBuffer[x0+i+(y0+currentLine)*ST7789V_WIDTH];
 				uint8_t r = color8 & 0x07;
 				uint8_t g = (color8>>3) & 0x07;
 				uint8_t b = color8 >> 6;
-				internalBuffer[i*2+0] = g | (r << 5);
-				internalBuffer[i*2+1] = (b << 3);
+                add_byte_to_transfer(DataByte, (g | (r << 5)));
+                add_byte_to_transfer(DataByte, (b << 3));
 			}
-			res = driver_st7789v_send(internalBuffer, transactionWidth*2, true);
+			res = send_transfer(internalBuffer, internalBufferBitLen, true);
 			if (res != ESP_OK) return res;
 		}
 		w -= transactionWidth;

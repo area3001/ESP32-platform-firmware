@@ -11,7 +11,7 @@ menu "Driver: ST7789V LCD display"
 	
 	config PIN_NUM_ST7789V_DCX
 		depends on DRIVER_ST7789V_ENABLE
-		int "GPIO pin used for D/CX"
+		int "GPIO pin used for D/CX (or -1 for 3-wire/9-bit mode)"
 		
 	config PIN_NUM_ST7789V_CS
 		depends on DRIVER_ST7789V_ENABLE
